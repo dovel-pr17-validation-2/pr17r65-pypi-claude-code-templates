@@ -1,0 +1,366 @@
+/**
+ * TrackingService - anonymous usage analytics, sent to www.aitmpl.com:
+ * - trackDownload            -> /api/track-download-supabase    (Supabase component_downloads)
+ * - trackCommandExecution    -> /api/track-command-usage        (Neon command_usage_logs)
+ * - trackInstallationOutcome -> /api/track-installation-outcome (Neon installation_outcomes)
+ * The endpoints only accept the names in dashboard/src/lib/api/usage-tracking.ts;
+ * dashboard/tests/usage-tracking.test.ts fails when this CLI sends one they reject.
+ * Every request is best effort: it never throws and gives up after 5 s.
+ * Opt out with CCT_NO_TRACKING=true or CCT_NO_ANALYTICS=true (CI=true also disables it).
+ */
+
+const { detectClient } = require('./agent-detection');
+
+class TrackingService {
+    constructor() {
+        this.trackingEnabled = this.shouldEnableTracking();
+        this.timeout = 5000; // 5s timeout for tracking requests
+    }
+
+    /**
+     * Check if tracking should be enabled (respects user privacy)
+     */
+    shouldEnableTracking() {
+        // Allow users to opt-out
+        if (process.env.CCT_NO_TRACKING === 'true' || 
+            process.env.CCT_NO_ANALYTICS === 'true' ||
+            process.env.CI === 'true') {
+            return false;
+        }
+        
+        // Enable public telemetry tracking
+        return true;
+    }
+
+    /**
+     * Track a component download/installation
+     * @param {string} componentType - 'agent', 'command', or 'mcp'
+     * @param {string} componentName - Name of the component
+     * @param {object} metadata - Additional context (optional)
+     */
+    async trackDownload(componentType, componentName, metadata = {}) {
+        if (!this.trackingEnabled) {
+            return;
+        }
+
+        try {
+            // Create tracking payload
+            const trackingData = this.createTrackingPayload(componentType, componentName, metadata);
+            
+            // Callers may ignore the promise (fire-and-forget) or await it
+            // when the process is about to exit.
+            return this.sendTrackingData(trackingData)
+                .catch(error => {
+                    // Silent failure - tracking should never impact functionality
+                    // Only show debug info when explicitly enabled
+                    if (process.env.CCT_DEBUG === 'true') {
+                        console.debug('📊 Tracking info (non-critical):', error.message);
+                    }
+                });
+
+        } catch (error) {
+            // Silently handle any tracking errors
+            // Only show debug info when explicitly enabled
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Analytics error (non-critical):', error.message);
+            }
+        }
+    }
+
+    /**
+     * Create standardized tracking payload
+     */
+    createTrackingPayload(componentType, componentName, metadata) {
+        const timestamp = new Date().toISOString();
+        
+        return {
+            event: 'component_download',
+            component_type: componentType,
+            component_name: componentName,
+            timestamp: timestamp,
+            session_id: this.generateSessionId(),
+            environment: {
+                node_version: process.version,
+                platform: process.platform,
+                arch: process.arch,
+                cli_version: this.getCliVersion()
+            },
+            client: detectClient(),
+            metadata: metadata
+        };
+    }
+
+    /**
+     * Send tracking data to database endpoint
+     */
+    async sendTrackingData(trackingData) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+        try {
+            await this.sendToDatabase(trackingData, controller.signal);
+
+            clearTimeout(timeoutId);
+
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Download tracked successfully');
+            }
+            
+        } catch (error) {
+            clearTimeout(timeoutId);
+            // Silent fail - tracking should never break user experience
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Tracking failed (non-critical):', error.message);
+            }
+        }
+    }
+
+    /**
+     * Send a component download to /api/track-download-supabase
+     */
+    async sendToDatabase(trackingData, signal) {
+        try {
+            // Extract component path from metadata
+            const componentPath = trackingData.metadata?.target_directory || 
+                                trackingData.metadata?.path || 
+                                trackingData.component_name;
+
+            // Extract category from metadata or component name
+            const category = trackingData.metadata?.category || 
+                           (trackingData.component_name.includes('/') ? 
+                            trackingData.component_name.split('/')[0] : 'general');
+
+            const payload = {
+                type: trackingData.component_type,
+                name: trackingData.component_name,
+                path: componentPath,
+                category: category,
+                cliVersion: trackingData.environment?.cli_version || 'unknown',
+                agent: trackingData.client?.agent ?? null,
+                entrypoint: trackingData.client?.entrypoint ?? null,
+                isTty: trackingData.client?.isTty ?? null
+            };
+
+            const response = await fetch('https://www.aitmpl.com/api/track-download-supabase', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': `claude-code-templates/${trackingData.environment?.cli_version || 'unknown'}`
+                },
+                body: JSON.stringify(payload),
+                signal: signal
+            });
+
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Payload sent:', JSON.stringify(payload, null, 2));
+                if (response.ok) {
+                    console.debug('📊 Successfully saved to database');
+                } else {
+                    console.debug(`📊 Database save failed with status: ${response.status}`);
+                    try {
+                        const errorText = await response.text();
+                        console.debug('📊 Error response:', errorText);
+                    } catch (e) {
+                        console.debug('📊 Could not read error response');
+                    }
+                }
+            }
+
+        } catch (error) {
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Database tracking failed:', error.message);
+            }
+            // Don't throw - tracking should be non-blocking
+        }
+    }
+
+
+    /**
+     * Generate a session ID for grouping related downloads
+     */
+    generateSessionId() {
+        return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+    }
+
+    /**
+     * Get CLI version from package.json
+     */
+    getCliVersion() {
+        try {
+            const path = require('path');
+            const fs = require('fs');
+            const packagePath = path.join(__dirname, '..', 'package.json');
+            const packageData = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+            return packageData.version || 'unknown';
+        } catch (error) {
+            return 'unknown';
+        }
+    }
+
+    /**
+     * Track template installation (full project setup)
+     */
+    async trackTemplateInstallation(language, framework, metadata = {}) {
+        return this.trackDownload('template', `${language}/${framework}`, {
+            ...metadata,
+            installation_type: 'full_template'
+        });
+    }
+
+    /**
+     * Track CLI command execution (anything that is not a component install)
+     * @param {string} commandName - One of VALID_COMMANDS in dashboard/src/lib/api/usage-tracking.ts
+     *   (analytics, chats, health-check, catalog-browser, workflow, removed-command, ...)
+     * @param {object} metadata - Additional context (optional)
+     * @returns {Promise<void>} Settles when the request finishes or times out; never rejects
+     */
+    async trackCommandExecution(commandName, metadata = {}) {
+        if (!this.trackingEnabled) {
+            return;
+        }
+
+        try {
+            const payload = {
+                command: commandName,
+                cliVersion: this.getCliVersion(),
+                nodeVersion: process.version,
+                platform: process.platform,
+                arch: process.arch,
+                sessionId: this.generateSessionId(),
+                metadata: metadata
+            };
+
+            return this.sendCommandTracking(payload)
+                .catch(error => {
+                    if (process.env.CCT_DEBUG === 'true') {
+                        console.debug('📊 Command tracking info (non-critical):', error.message);
+                    }
+                });
+
+        } catch (error) {
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Command tracking error (non-critical):', error.message);
+            }
+        }
+    }
+
+    /**
+     * Send command tracking to Neon Database
+     */
+    async sendCommandTracking(payload) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+        try {
+            const response = await fetch('https://www.aitmpl.com/api/track-command-usage', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': `claude-code-templates/${payload.cliVersion}`
+                },
+                body: JSON.stringify(payload),
+                signal: controller.signal
+            });
+
+            clearTimeout(timeoutId);
+
+            if (process.env.CCT_DEBUG === 'true') {
+                if (response.ok) {
+                    console.debug('📊 Command execution tracked successfully');
+                } else {
+                    console.debug(`📊 Command tracking failed with status: ${response.status}`);
+                }
+            }
+
+        } catch (error) {
+            clearTimeout(timeoutId);
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Command tracking failed (non-critical):', error.message);
+            }
+        }
+    }
+    /**
+     * Track installation outcome (success/failure with timing)
+     * @param {string} componentType - agent, command, mcp, setting, hook, skill, loop, mod, template
+     * @param {string} componentName - Name of the component
+     * @param {string} outcome - success, failure, or partial
+     * @param {object} metadata - { errorType, errorMessage, durationMs, batchId }
+     */
+    async trackInstallationOutcome(componentType, componentName, outcome, metadata = {}) {
+        if (!this.trackingEnabled) {
+            return;
+        }
+
+        try {
+            const payload = {
+                componentType,
+                componentName,
+                outcome,
+                errorType: metadata.errorType || null,
+                errorMessage: metadata.errorMessage || null,
+                durationMs: metadata.durationMs || null,
+                cliVersion: this.getCliVersion(),
+                nodeVersion: process.version,
+                platform: process.platform,
+                arch: process.arch,
+                batchId: metadata.batchId || null
+            };
+
+            return this.sendInstallationOutcome(payload)
+                .catch(error => {
+                    if (process.env.CCT_DEBUG === 'true') {
+                        console.debug('📊 Installation outcome tracking info (non-critical):', error.message);
+                    }
+                });
+
+        } catch (error) {
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Installation outcome tracking error (non-critical):', error.message);
+            }
+        }
+    }
+
+    /**
+     * Send installation outcome to Neon Database
+     */
+    async sendInstallationOutcome(payload) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+        try {
+            const response = await fetch('https://www.aitmpl.com/api/track-installation-outcome', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': `claude-code-templates/${payload.cliVersion}`
+                },
+                body: JSON.stringify(payload),
+                signal: controller.signal
+            });
+
+            clearTimeout(timeoutId);
+
+            if (process.env.CCT_DEBUG === 'true') {
+                if (response.ok) {
+                    console.debug('📊 Installation outcome tracked successfully');
+                } else {
+                    console.debug(`📊 Installation outcome tracking failed with status: ${response.status}`);
+                }
+            }
+
+        } catch (error) {
+            clearTimeout(timeoutId);
+            if (process.env.CCT_DEBUG === 'true') {
+                console.debug('📊 Installation outcome tracking failed (non-critical):', error.message);
+            }
+        }
+    }
+}
+
+// Export singleton instance
+const trackingService = new TrackingService();
+
+module.exports = {
+    TrackingService,
+    trackingService
+};

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "DeepGraph Vue MCP": {
+      "description": "Analyze Vue.js applications including component composition, reactive data flow, and template-script relationships.",
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-code-graph@1.1.2",
+        "vuejs/core"
+      ]
+    }
+  }
+}

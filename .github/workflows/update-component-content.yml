@@ -1,0 +1,147 @@
+name: Update component content
+
+# Content-only refresh of the generated catalog. Runs when a component
+# changes on main and regenerates every generated artifact WITHOUT querying
+# Supabase (--skip-downloads keeps the download counts already in the
+# catalog), so it finishes in seconds. The download counts themselves are
+# refreshed by update-json-data.yml (daily cron), which pulls the whole
+# component_downloads table and takes minutes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cli-tool/components/**'
+      - 'cli-tool/templates/**'
+      - 'scripts/generate_components_json.py'
+      - 'scripts/external_skills.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # to start deploy.yml once the regenerated catalog is pushed
+  actions: write
+
+concurrency:
+  group: generated-catalog
+  cancel-in-progress: false
+
+jobs:
+  update-content:
+    runs-on: ubuntu-latest
+    # The daily cron's own commits touch only generated files, which are not
+    # in `paths`, so this job never re-triggers itself. A workflow_dispatch is
+    # always allowed: pr-automerge.yml dispatches this job with GITHUB_TOKEN
+    # (actor github-actions[bot]) after an automerge, and skipping that run
+    # left the merged component off the catalog.
+    if: github.event_name == 'workflow_dispatch' || github.actor != 'github-actions[bot]'
+
+    env:
+      DATA_PATHS: >-
+        docs/components.json
+        dashboard/public/components.json
+        dashboard/public/counts.json
+        dashboard/public/search-index.json
+        dashboard/public/components
+        dashboard/public/component-content
+        dashboard/public/api/v1
+        dashboard/public/marketplace.json
+        docs-site/snippets
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Latest main, not the commit that triggered the run: runs queue in
+          # the concurrency group, and one that regenerated from its own older
+          # commit conflicted on `git pull --rebase` with the catalog commit
+          # the run before it had pushed (the BrewPage and ScrapingBee runs,
+          # 2026-11-15). The generator rebuilds everything, so the newest tree
+          # is always the right input.
+          ref: main
+          # Full history (trees only) for each component's last commit and
+          # date added on its page; a shallow clone keeps the previous values.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          # 3.12+: SkillSpector's minimum
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'cli-tool/package-lock.json'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests python-dotenv pyyaml jsonschema
+          # NVIDIA SkillSpector (not on PyPI). The generator only rescans
+          # components whose files changed, or every component when the
+          # SkillSpector version changes, so bump this tag on purpose.
+          pip install "git+https://github.com/NVIDIA/skillspector.git@v2.12.0"
+
+      - name: Install Node.js dependencies
+        run: |
+          cd cli-tool
+          npm ci --ignore-scripts
+
+      - name: Regenerate the catalog, keeping the current download counts
+        run: python scripts/generate_components_json.py --skip-downloads
+
+      - name: Refresh the docs tables (component counts) for docs.aitmpl.com
+        run: python docs-site/scripts/generate_snippets.py
+
+      # The generated files are single-line JSON blobs, so two commits that
+      # both touch them always conflict on a rebase. They are also fully
+      # reproducible, so when main moves during the run (another catalog
+      # commit, the daily cron, a maintainer PR that ships its own catalog)
+      # this regenerates on the new main and pushes again instead of
+      # rebasing, the same loop update-json-data.yml uses.
+      - name: Commit and push the generated data
+        id: check_changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          for attempt in 1 2 3 4 5; do
+            if [ "$attempt" -gt 1 ]; then
+              git fetch origin main
+              git reset --hard origin/main
+              python scripts/generate_components_json.py --skip-downloads
+              python docs-site/scripts/generate_snippets.py
+            fi
+            git add -A -- $DATA_PATHS
+            if git diff --cached --quiet -- $DATA_PATHS; then
+              echo "No changes in the generated data."
+              exit 0
+            fi
+            git diff --cached --stat -- $DATA_PATHS
+            git commit -m "chore: Update component content
+
+          🤖 Generated with [GitHub Actions](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            if git push origin HEAD:main; then
+              echo "changed=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Push rejected (main moved), regenerating on the new main ($attempt/5)"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not push the regenerated catalog after 5 attempts"
+          exit 1
+
+      # The push above uses GITHUB_TOKEN, which GitHub never lets trigger
+      # another workflow, so deploy.yml's `push: dashboard/**` does not fire
+      # for it. Dispatch the deploy explicitly so the new catalog reaches
+      # aitmpl.com; a workflow_dispatch is the one event GITHUB_TOKEN may raise.
+      - name: Deploy the updated catalog
+        if: steps.check_changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run deploy.yml --ref main

@@ -1,0 +1,79 @@
+name: Skill Security Scan (Full)
+
+# Scans EVERY skill component with SkillSpector (NVIDIA, Apache-2.0) static
+# analysis. Runs weekly and on demand. Reports only — never blocks. Writes a
+# Markdown summary to the run and keeps the SARIF as an artifact.
+#
+# The full SARIF is NOT uploaded to code scanning any more: ~5,000 catalog
+# findings (2026-11-05) buried the alerts about our own code. Each run uploads
+# an empty SARIF under the old `skillspector-full` category instead, which
+# closes those alerts and keeps them closed. Per-component results live on
+# the catalog (SkillSpector seal on aitmpl.com); changed skills are still
+# uploaded by skill-security-scan.yml on PRs.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  skill-scan-all:
+    name: SkillSpector (all skills)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install SkillSpector
+        run: pip install "git+https://github.com/NVIDIA/skillspector.git@v2.12.0"
+
+      - name: Run SkillSpector on all skills
+        id: scan
+        continue-on-error: true
+        run: |
+          python scripts/skillspector_scan.py \
+            --all \
+            --threshold 50 \
+            --output-md skillspector-report.md \
+            --output-sarif skillspector.sarif
+
+      - name: Publish summary
+        if: always()
+        run: cat skillspector-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: skillspector-full-report
+          path: |
+            skillspector-report.md
+            skillspector.sarif
+          retention-days: 90
+
+      - name: Write empty SARIF (retires the skillspector-full category)
+        if: always()
+        run: |
+          cat > skillspector-empty.sarif <<'JSON'
+          {"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json",
+           "runs":[{"tool":{"driver":{"name":"skillspector","informationUri":"https://github.com/NVIDIA/skillspector","rules":[]}},"results":[]}]}
+          JSON
+
+      - name: Upload empty SARIF to code scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: skillspector-empty.sarif
+          category: skillspector-full
