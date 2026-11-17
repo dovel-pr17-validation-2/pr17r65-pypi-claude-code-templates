@@ -13,7 +13,7 @@ name = "cct"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6.8", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -22,7 +22,7 @@ dialoguer = "0.11"
 indicatif = "0.17"
 owo-colors = "4"
 directories = "5"
-anyhow = "1"
+anyhow = "1.0.104"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 open = "5"
