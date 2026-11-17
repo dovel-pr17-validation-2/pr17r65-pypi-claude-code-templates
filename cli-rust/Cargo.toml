@@ -26,7 +26,7 @@ anyhow = "1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 open = "5"
-base64 = "0.22"
+base64 = "0.23.1"
 pathdiff = "0.2"
 
 [dev-dependencies]
